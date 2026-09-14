@@ -193,7 +193,7 @@ int getKeyChannel(char c) {
 // ====================== 打字函数（适配IDEA缩进） ======================
 void typeText(String s) {
   Serial.println("[TYPE] =====开始输出文本=====");
-  Serial.println("[TYPE] 总长度=%d\n, 原始内容=%s", s.length(), s.c_str());
+  Serial.printf("[TYPE] 总长度=%u, 原始内容=%s\n", s.length(), s.c_str());
   for (int i = 0; i < s.length(); i++) {
     char c = s[i];
     int ch;
