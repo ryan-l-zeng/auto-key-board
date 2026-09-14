@@ -2,42 +2,29 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
-
 // 74HC595 引脚定义
 #define SER      2
 #define SRCLK    3
 #define RCLK     10
-
 // ====================== 自定义按键映射 ======================
 const int KEY_HOME    = 42;   // Home键
 const int KEY_SHIFT   = 58;   // Shift按键
 const int KEY_ENTER   = 59;   // 回车按键
-const int KEY_CTRL    = 60;   // Ctrl按键
-
-// 函数原型声明
-int getKeyChannel(char c);
-bool needShift(char c, int &outCh);
-
-// 【新增】网页复制缓存：保存文本框的内容
-String copyBuffer = "";
-
 // ====================================================================================
 // WiFi 热点配置
 WebServer server(80);
 const char* AP_SSID = "ESP32-KEYBOARD";
 const char* AP_PWD  = "12345678";
-
 // 全局状态
 String connectedWiFiName = "未连接";
 IPAddress localIP;
 Preferences prefs;
-
-// ======================== 速度配置 ========================
-int keyPressMs = 40;
-int keyDelayMs = 60;
-bool humanMode = false;
-int currentMode = 1;
-
+// ======================== 速度配置（参数统一管理） ========================
+int keyPressMs = 40;    // 按键按下时长
+int keyDelayMs = 60;   // 按键间隔时长
+bool humanMode = false; // 拟人模式
+int currentMode = 1;   // 当前模式 0=慢速 1=中速 2=快速 3=拟人
+// 获取速度名称
 String getSpeedName() {
   switch(currentMode){
     case 0: return "慢速";
@@ -47,37 +34,37 @@ String getSpeedName() {
     default: return "中速";
   }
 }
-
-void setSpeedSlow()  { keyPressMs = 60; keyDelayMs = 120; humanMode = false; currentMode = 0; }
-void setSpeedMid()   { keyPressMs = 40; keyDelayMs = 60;  humanMode = false; currentMode = 1; }
-void setSpeedFast()  { keyPressMs = 25; keyDelayMs = 30;  humanMode = false; currentMode = 2; }
-void setSpeedHuman() { humanMode = true; currentMode = 3; }
-
+// 速度模式设置
+void setSpeedSlow()  { keyPressMs = 60; keyDelayMs = 120; humanMode = false; currentMode = 0; Serial.println("[SPEED] 设置为慢速"); }
+void setSpeedMid()   { keyPressMs = 40; keyDelayMs = 60;  humanMode = false; currentMode = 1; Serial.println("[SPEED] 设置为中速"); }
+void setSpeedFast()  { keyPressMs = 25; keyDelayMs = 30;  humanMode = false; currentMode = 2; Serial.println("[SPEED] 设置为快速"); }
+void setSpeedHuman() { humanMode = true; currentMode = 3; Serial.println("[SPEED] 设置为拟人速"); }
 // ====================================================================
+// 连接保存的WiFi
 bool connectToSavedWiFi() {
-  Serial.println("[INFO] 尝试读取NVS保存的WiFi信息");
+  Serial.println("[WiFi] 读取NVS保存WiFi");
   prefs.begin("wifi", true);
   String savedSSID = prefs.getString("ssid", "");
   String savedPWD = prefs.getString("pwd", "");
   prefs.end();
-  if (savedSSID.isEmpty()){
-    Serial.println("[INFO] NVS内无保存WiFi");
+  if (savedSSID.isEmpty()) {
+    Serial.println("[WiFi] NVS无保存WiFi");
     return false;
   }
-  Serial.printf("[INFO] 读取到SSID:%s，开始连接...\n", savedSSID.c_str());
+  Serial.printf("[WiFi] 尝试连接SSID:%s\n", savedSSID.c_str());
   WiFi.begin(savedSSID.c_str(), savedPWD.c_str());
   for (int i = 0; i < 20; i++) {
     delay(500);
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("[SUCCESS] STA连接成功，IP:");
+      Serial.print("[WiFi] STA连接成功 IP:");
       Serial.println(WiFi.localIP().toString());
       return true;
     }
   }
-  Serial.println("[WARN] STA连接超时");
+  Serial.println("[WiFi] STA连接超时");
   return false;
 }
-
+// WiFi状态监测（自动保存已连接WiFi）
 void wifiMonitor() {
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck < 1000) return;
@@ -95,7 +82,7 @@ void wifiMonitor() {
     localIP = IPAddress(0, 0, 0, 0);
   }
 }
-
+// 74HC595 输出64位数据
 void send64bit(uint64_t data) {
   digitalWrite(RCLK, LOW);
   shiftOut(SER, SRCLK, MSBFIRST, (data >> 56) & 0xFF);
@@ -108,59 +95,51 @@ void send64bit(uint64_t data) {
   shiftOut(SER, SRCLK, MSBFIRST, data & 0xFF);
   digitalWrite(RCLK, HIGH);
 }
-
+// 所有按键松开
 void allKeysOff() {
   send64bit(0);
 }
-
+// 单个按键按下
 void keyPress(int ch) {
   if (ch < 0 || ch > 63) return;
+
   allKeysOff();
   delay(10);
   uint64_t mask = (uint64_t)1 << ch;
   send64bit(mask);
+
+  // 按下延时
   humanMode ? delay(random(50,100)) : delay(keyPressMs);
   allKeysOff();
+  // 间隔延时
   humanMode ? delay(random(80,250)) : delay(keyDelayMs);
 }
-
+// ====================== 核心优化：Shift组合键（适配中文输入法） ======================
+// 时序：先按Shift → 再按字符 → 先松Shift → 再松字符
 void shiftKeyPress(int ch) {
   if (ch < 0 || ch > 63) return;
+
   allKeysOff();
   delay(10);
+  // 1. 单独按下 Shift
   uint64_t shiftMask = (uint64_t)1 << KEY_SHIFT;
   send64bit(shiftMask);
   delay(15);
+  // 2. 按下目标字符
   uint64_t keyMask = shiftMask | ((uint64_t)1 << ch);
   send64bit(keyMask);
+  // 按下保持时长
   humanMode ? delay(random(50,100)) : delay(keyPressMs);
+  // 3. 先松开 Shift
   send64bit((uint64_t)1 << ch);
   delay(15);
+  // 4. 松开字符
   allKeysOff();
-  delay(10);
+  delay(10); // 【优化】硬件防抖，防止按键粘连
+  // 间隔延时
   humanMode ? delay(random(100,250)) : delay(keyDelayMs);
 }
-
-// 底层硬件Ctrl组合函数保留（可代码内部调用，网页不再使用）
-void ctrlKeyPress(int ch)
-{
-  if (ch <0 || ch>63) return;
-  allKeysOff();
-  delay(10);
-  uint64_t ctrlMask = (uint64_t)1 << KEY_CTRL;
-  send64bit(ctrlMask);
-  delay(15);
-  uint64_t keyMask = ctrlMask | ((uint64_t)1 << ch);
-  send64bit(keyMask);
-  humanMode ? delay(random(50,100)) : delay(keyPressMs);
-  send64bit((uint64_t)1 << ch);
-  delay(15);
-  allKeysOff();
-  humanMode ? delay(random(100,250)) : delay(keyDelayMs);
-}
-void ctrlC()  { int ch_c = getKeyChannel('c'); ctrlKeyPress(ch_c); }
-void ctrlV()  { int ch_v = getKeyChannel('v'); ctrlKeyPress(ch_v); }
-
+// 判断是否需要Shift + 字符映射
 bool needShift(char c, int &outCh) {
   switch (c) {
     case '~':  outCh = 0;  return true;
@@ -187,14 +166,14 @@ bool needShift(char c, int &outCh) {
     default:   return false;
   }
 }
-
+// 按键通道映射表
 int getKeyChannel(char c) {
   switch (c) {
     case '`':  return 0;
     case '1':  return 1; case '2': return 2; case '3': return 3; case '4': return 4;
     case '5':  return 5; case '6': return 6; case '7': return 7; case '8': return 8;
     case '9':  return 9; case '0': return 10; case '-': return 11; case '=': return 12;
-    case 8:    return 13;
+    case 8:    return 13; // 退格
     case '\t': return 14;
     case 'q':  return 15; case 'w': return 16; case 'e': return 17; case 'r': return 18;
     case 't':  return 19; case 'y': return 20; case 'u': return 21; case 'i': return 22;
@@ -203,41 +182,46 @@ int getKeyChannel(char c) {
     case 'a':  return 29; case 's': return 30; case 'd': return 31; case 'f': return 32;
     case 'g':  return 33; case 'h': return 34; case 'j': return 35; case 'k': return 36;
     case 'l':  return 37; case ';': return 38; case '\'': return 39;
-    case '\n': return KEY_ENTER;
+    case '\n': return KEY_ENTER; // 回车
     case 'z':  return 57; case 'x': return 56; case 'c': return 55; case 'v': return 54;
     case 'b':  return 53; case 'n': return 52; case 'm': return 51; case ',': return 50;
     case '.':  return 49; case '/': return 48; case ' ': return 47;
+
     default:   return -1;
   }
 }
-
+// ====================== 打字函数（适配IDEA缩进） ======================
 void typeText(String s) {
-  Serial.printf("[INFO] 输出文本，长度:%d\n", s.length());
+  Serial.println("[TYPE] =====开始输出文本=====");
+  Serial.println("[TYPE] 总长度=%d\n, 原始内容=%s", s.length(), s.c_str());
   for (int i = 0; i < s.length(); i++) {
     char c = s[i];
     int ch;
+    // Shift符号处理
     if (needShift(c, ch)) {
       shiftKeyPress(ch);
       continue;
     }
+    // 大写字母处理
     if (c >= 'A' && c <= 'Z') {
       ch = getKeyChannel(c + 32);
       shiftKeyPress(ch);
       continue;
     }
+    // 普通字符
     ch = getKeyChannel(c);
     if (ch >= 0) {
       keyPress(ch);
+      // 修复IDEA缩进：延时等待IDE处理 + Home键回到行首
       if(c == '\n'){
         delay(80);
         keyPress(KEY_HOME);
       }
     }
   }
-  Serial.println("[INFO] 文本输出完成");
+  Serial.println("[TYPE] =====输出文本完成=====");
 }
-
-// ===================== 网页主页 =====================
+// ===================== 网页界面（100%原样保留） =====================
 void sendHomePage() {
   String apIP = WiFi.softAPIP().toString();
   String staIP = (WiFi.status() == WL_CONNECTED)? localIP.toString() : "0.0.0.0";
@@ -264,21 +248,22 @@ button{border:none;border-radius:8px;color:white;cursor:pointer}
 .btn-conn{padding:6px 12px;background:#007bff}
 h4{margin:8px 0 10px 0;color:#333;font-size:15px}
 textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid #ddd;margin:10px 0}
+/* 速度按钮 统一蓝色系 */
 .speed-btn{
   padding:12px;
   text-align:left;
   font-size:14px;
-  background:#4da6ff;
+  background:#4da6ff;  /* 未选中：淡蓝色（同色系） */
   border:none;
   color:white;
   width:100%;
   margin-bottom:6px;
 }
+/* 选中：和开始输入完全一样的颜色 */
 .speed-btn.active{
   background:#007bff;
   font-weight:bold;
 }
-.btn-row{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;}
 </style>
 </head>
 <body>
@@ -289,6 +274,7 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
 <strong>STA 连接：)HTML" + connectedWiFiName + R"HTML(</strong><br>
 <strong>IP 地址：)HTML" + staIP + R"HTML(</strong>
 </div>
+<!-- 速度折叠面板（和WiFi一样）标题显示当前速度 -->
 <div class="accordion">
   <button class="accordion-header" onclick="toggleSpeed()">⚡ 打字速度 - 当前：)HTML"+speedName+R"HTML(</button>
   <div class="accordion-content" id="speedPanel">
@@ -298,6 +284,7 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
     <button class="speed-btn )HTML"+(currentMode==3?"active":"")+R"HTML(" onclick="location.href='/human'">👤 拟人速 (约 120~200 字符/分钟)</button>
   </div>
 </div>
+<!-- WiFi折叠面板 -->
 <div class="accordion">
 <button class="accordion-header" onclick="toggleAccordion()">🔗 切换WiFi</button>
 <div class="accordion-content" id="wifiPanel">
@@ -310,11 +297,7 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
 </div>
 <form action="/run" method="post">
 <textarea name="content" placeholder="在这里输入要自动打的文字..."></textarea>
-<div class="btn-row">
 <button type="submit" style="padding:10px 18px;background:#007bff">✅ 开始输入</button>
-<button type="submit" formaction="/copybuf" style="padding:10px 18px;background:#28a745">📋复制框内文本到ESP缓存</button>
-<button type="button" onclick="location.href='/pastebuf'" style="padding:10px 18px;background:#fd7e14">📄粘贴缓存（输出打字）</button>
-</div>
 </form>
 </div>
 <script>
@@ -331,7 +314,6 @@ function toggleSpeed(){
 )HTML";
   server.send(200, "text/html", html);
 }
-
 void sendScanPage() {
   bool isStaOnline = (WiFi.status() == WL_CONNECTED);
   String staIP = isStaOnline? localIP.toString() : "0.0.0.0";
@@ -357,7 +339,6 @@ h4{margin:8px 0 10px 0;color:#333;font-size:15px}
 textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid #ddd;margin:10px 0}
 .speed-btn{background:#4da6ff;padding:12px;text-align:left;font-size:14px;border:none;color:white;width:100%;margin-bottom:6px}
 .speed-btn.active{background:#007bff;font-weight:bold}
-.btn-row{display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;}
 </style>
 </head>
 <body>
@@ -375,9 +356,14 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
   <h4>附近 WiFi</h4>
 )HTML";
   WiFi.scanDelete();
-  int currentChannel = WiFi.channel();
+  // ==============================================
+  // 核心修复：仅扫描当前STA信道 → STA绝对不断网
+  // ==============================================
+  int currentChannel = WiFi.channel(); // 获取当前连接的WiFi信道
   int n = WiFi.scanNetworks(false, false, currentChannel, 120);
+
   if(n == WIFI_SCAN_FAILED) n = 0;
+
   if (n > 0) {
     for (int i = 0; i < n; i++) {
       String ssid = WiFi.SSID(i);
@@ -392,18 +378,13 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
 </div>
 <form action="/run" method="post">
 <textarea name="content" placeholder="在这里输入要自动打的文字..."></textarea>
-<div class="btn-row">
 <button type="submit" style="padding:10px 18px;background:#007bff">✅ 开始输入</button>
-<button type="submit" formaction="/copybuf" style="padding:10px 18px;background:#28a745">📋复制框内文本到ESP缓存</button>
-<button type="button" onclick="location.href='/pastebuf'" style="padding:10px 18px;background:#fd7e14">📄粘贴缓存（输出打字）</button>
-</div>
 </form>
 </div>
 </body></html>
 )HTML";
   server.send(200, "text/html", html);
 }
-
 void sendGoPage() {
   String ssid = server.arg("ssid");
   String html = R"HTML(
@@ -426,21 +407,22 @@ button{width:100%;padding:10px;background:#007bff;color:white;border:none;border
 )HTML";
   server.send(200, "text/html", html);
 }
-
+// Web请求处理函数
 void handleConn() {
+  Serial.println("[WEB] 收到 /conn 请求，WiFi连接");
   String ssid = server.arg("ssid");
   String pwd = server.arg("pwd");
-  Serial.printf("[INFO] Web请求连接WiFi: %s\n", ssid.c_str());
   WiFi.disconnect(false);
   delay(200);
   WiFi.begin(ssid.c_str(), pwd.c_str());
   connectedWiFiName = "连接中...";
+
   for (int i = 0; i < 10; i++) {
     delay(500);
     if (WiFi.status() == WL_CONNECTED) {
       connectedWiFiName = WiFi.SSID();
       localIP = WiFi.localIP();
-      Serial.print("[SUCCESS] STA网页连接成功 IP:");
+      Serial.print("[WEB] WiFi连接成功 IP:");
       Serial.println(localIP.toString());
       break;
     }
@@ -448,82 +430,63 @@ void handleConn() {
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "");
 }
-
 void handleRun() {
-  Serial.println("[INFO] Web收到执行输入指令");
+  Serial.println("[WEB] 收到 /run 请求，执行typeText");
   typeText(server.arg("content"));
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "");
 }
-
-// ========== 新接口：复制文本框内容到ESP内存缓存 ==========
-void handleCopyBuf(){
-  copyBuffer = server.arg("content");
-  Serial.printf("[INFO] 已缓存网页文本，长度=%d\n", copyBuffer.length());
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "");
-}
-// ========== 新接口：把缓存内容输出打字 ==========
-void handlePasteBuf(){
-  Serial.println("[INFO] 执行粘贴缓存输出");
-  typeText(copyBuffer);
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "");
-}
-
-void handleSlow()  { setSpeedSlow();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleMid()   { setSpeedMid();   server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleFast()  { setSpeedFast();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleHuman() { setSpeedHuman(); server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-
+void handleSlow()  { Serial.println("[WEB] /slow"); setSpeedSlow();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
+void handleMid()   { Serial.println("[WEB] /mid"); setSpeedMid();   server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
+void handleFast()  { Serial.println("[WEB] /fast"); setSpeedFast();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
+void handleHuman() { Serial.println("[WEB] /human"); setSpeedHuman(); server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
 // ===================== 初始化 =====================
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n====== 系统启动 ======");
-  Serial.println("[INFO] Serial初始化完成");
+  delay(600);
+  Serial.println("\n========== SYSTEM BOOT START ==========");
+  Serial.println("[SETUP] Serial init ok");
 
   randomSeed(analogRead(0));
-  Serial.println("[INFO] 随机种子初始化");
+  Serial.println("[SETUP] randomSeed done");
 
+  // 595引脚初始化
   pinMode(SER, OUTPUT);
   pinMode(SRCLK, OUTPUT);
   pinMode(RCLK, OUTPUT);
-  Serial.println("[INFO] 595引脚配置完成");
-  allKeysOff();
-  Serial.println("[INFO] 全部按键置低");
-  setSpeedMid();
-  Serial.println("[INFO] 默认中速模式");
+  Serial.println("[SETUP] 74HC595 pinMode set");
 
-  Serial.println("[INFO] WiFi进入AP+STA模式");
+  allKeysOff();
+  Serial.println("[SETUP] allKeysOff() 全部按键关闭");
+
+  setSpeedMid();
+  Serial.println("[SETUP] 速度初始化完成");
+
+  // WiFi初始化
+  Serial.println("[SETUP] WiFi.mode(WIFI_AP_STA)");
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PWD);
-  Serial.print("[SUCCESS] AP热点启动成功 SSID:");
-  Serial.print(AP_SSID);
-  Serial.print(" IP:");
-  Serial.println(WiFi.softAPIP().toString());
+  Serial.printf("[SETUP] AP热点启动 SSID=%s IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);
   connectToSavedWiFi();
   wifiMonitor();
 
+  // Web路由注册
   server.on("/", sendHomePage);
   server.on("/scan", sendScanPage);
   server.on("/go", sendGoPage);
   server.on("/conn", handleConn);
   server.on("/run", handleRun);
-  server.on("/copybuf", handleCopyBuf);
-  server.on("/pastebuf", handlePasteBuf);
   server.on("/slow", handleSlow);
   server.on("/mid",  handleMid);
   server.on("/fast", handleFast);
   server.on("/human",handleHuman);
   server.begin();
-  Serial.println("[SUCCESS] Web服务已启动");
-  Serial.println("====== 系统就绪 ======");
+  Serial.println("[SETUP] WebServer 80端口启动完成");
+  Serial.println("========== SYSTEM BOOT READY ==========\n");
 }
-
 void loop() {
   wifiMonitor();
   server.handleClient();
