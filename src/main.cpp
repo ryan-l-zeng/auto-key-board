@@ -2,31 +2,41 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+
+// ====================== 1. 硬件与按键定义 ======================
 // 74HC595 引脚定义
 #define SER      2
 #define SRCLK    3
 #define RCLK     10
+
 // ====================== 自定义按键映射 ======================
 const int KEY_HOME    = 42;   // Home键
 const int KEY_SHIFT   = 58;   // Shift按键
 const int KEY_ENTER   = 59;   // 回车按键
-// ====================================================================================
+
+// ====================== 2. WiFi 与 WebServer 状态 ======================
 // WiFi 热点配置
 WebServer server(80);
 const char* AP_SSID = "ESP32-KEYBOARD";
 const char* AP_PWD  = "12345678";
+
 // 全局状态
 String connectedWiFiName = "未连接";
 IPAddress localIP;
 Preferences prefs;
-// ======================== 速度配置（参数统一管理） ========================
-int keyPressMs = 40;    // 按键按下时长
-int keyDelayMs = 60;   // 按键间隔时长
-bool humanMode = false; // 拟人模式
-int currentMode = 1;   // 当前模式 0=慢速 1=中速 2=快速 3=拟人
-// 获取速度名称
-String getSpeedName() {
-  switch(currentMode){
+
+// ======================== 3. 速度配置（统一管理） ========================
+struct SpeedConfig {
+  int keyPressMs;
+  int keyDelayMs;
+  bool humanMode;
+  int currentMode;
+};
+
+SpeedConfig speedConfig = { 40, 60, false, 1 };
+
+String getSpeedNameForMode(int mode) {
+  switch (mode) {
     case 0: return "慢速";
     case 1: return "中速";
     case 2: return "快速";
@@ -34,12 +44,60 @@ String getSpeedName() {
     default: return "中速";
   }
 }
-// 速度模式设置
-void setSpeedSlow()  { keyPressMs = 60; keyDelayMs = 120; humanMode = false; currentMode = 0; Serial.println("[SPEED] 设置为慢速"); }
-void setSpeedMid()   { keyPressMs = 40; keyDelayMs = 60;  humanMode = false; currentMode = 1; Serial.println("[SPEED] 设置为中速"); }
-void setSpeedFast()  { keyPressMs = 25; keyDelayMs = 30;  humanMode = false; currentMode = 2; Serial.println("[SPEED] 设置为快速"); }
-void setSpeedHuman() { humanMode = true; currentMode = 3; Serial.println("[SPEED] 设置为拟人速"); }
-// ====================================================================
+
+String getSpeedName() {
+  return getSpeedNameForMode(speedConfig.currentMode);
+}
+
+String buildSpeedButtonHtml(int mode, const String& label, const String& path) {
+  bool active = (speedConfig.currentMode == mode);
+  return "<button class=\"speed-btn " + String(active ? "active" : "") + "\" onclick=\"location.href='" + path + "'\">" + label + "</button>";
+}
+
+void applySpeed(int mode) {
+  switch (mode) {
+    case 0:
+      speedConfig.keyPressMs = 60;
+      speedConfig.keyDelayMs = 120;
+      speedConfig.humanMode = false;
+      speedConfig.currentMode = 0;
+      Serial.println("[SPEED] 设置为慢速");
+      break;
+    case 1:
+      speedConfig.keyPressMs = 40;
+      speedConfig.keyDelayMs = 60;
+      speedConfig.humanMode = false;
+      speedConfig.currentMode = 1;
+      Serial.println("[SPEED] 设置为中速");
+      break;
+    case 2:
+      speedConfig.keyPressMs = 25;
+      speedConfig.keyDelayMs = 30;
+      speedConfig.humanMode = false;
+      speedConfig.currentMode = 2;
+      Serial.println("[SPEED] 设置为快速");
+      break;
+    case 3:
+      speedConfig.humanMode = true;
+      speedConfig.currentMode = 3;
+      Serial.println("[SPEED] 设置为拟人速");
+      break;
+    default:
+      applySpeed(1);
+      break;
+  }
+}
+
+void setSpeedSlow() { applySpeed(0); }
+void setSpeedMid() { applySpeed(1); }
+void setSpeedFast() { applySpeed(2); }
+void setSpeedHuman() { applySpeed(3); }
+
+// ====================== 4. WiFi 连接与状态监控 ======================
+String getStationIpString() {
+  return (WiFi.status() == WL_CONNECTED) ? localIP.toString() : "0.0.0.0";
+}
+
 // 连接保存的WiFi
 bool connectToSavedWiFi() {
   Serial.println("[WiFi] 读取NVS保存WiFi");
@@ -82,6 +140,8 @@ void wifiMonitor() {
     localIP = IPAddress(0, 0, 0, 0);
   }
 }
+
+// ====================== 5. 74HC595 键盘输出协议 ======================
 // 74HC595 输出64位数据
 void send64bit(uint64_t data) {
   digitalWrite(RCLK, LOW);
@@ -99,46 +159,63 @@ void send64bit(uint64_t data) {
 void allKeysOff() {
   send64bit(0);
 }
+
+void waitPressDuration() {
+  if (speedConfig.humanMode) {
+    delay(random(50, 100));
+  } else {
+    delay(speedConfig.keyPressMs);
+  }
+}
+
+void waitGapDuration(bool isShiftCombo = false) {
+  if (speedConfig.humanMode) {
+    delay(isShiftCombo ? random(100, 250) : random(80, 250));
+  } else {
+    delay(speedConfig.keyDelayMs);
+  }
+}
+
 // 单个按键按下
 void keyPress(int ch) {
   if (ch < 0 || ch > 63) return;
 
   allKeysOff();
   delay(10);
+
   uint64_t mask = (uint64_t)1 << ch;
   send64bit(mask);
 
-  // 按下延时
-  humanMode ? delay(random(50,100)) : delay(keyPressMs);
+  waitPressDuration();
   allKeysOff();
-  // 间隔延时
-  humanMode ? delay(random(80,250)) : delay(keyDelayMs);
+  waitGapDuration();
 }
-// ====================== 核心优化：Shift组合键（适配中文输入法） ======================
+
+// ====================== Shift组合键 ======================
 // 时序：先按Shift → 再按字符 → 先松Shift → 再松字符
 void shiftKeyPress(int ch) {
   if (ch < 0 || ch > 63) return;
 
   allKeysOff();
   delay(10);
-  // 1. 单独按下 Shift
+
   uint64_t shiftMask = (uint64_t)1 << KEY_SHIFT;
   send64bit(shiftMask);
   delay(15);
-  // 2. 按下目标字符
+
   uint64_t keyMask = shiftMask | ((uint64_t)1 << ch);
   send64bit(keyMask);
-  // 按下保持时长
-  humanMode ? delay(random(50,100)) : delay(keyPressMs);
-  // 3. 先松开 Shift
+
+  waitPressDuration();
+
   send64bit((uint64_t)1 << ch);
   delay(15);
-  // 4. 松开字符
+
   allKeysOff();
-  delay(10); // 【优化】硬件防抖，防止按键粘连
-  // 间隔延时
-  humanMode ? delay(random(100,250)) : delay(keyDelayMs);
+  delay(10);
+  waitGapDuration(true);
 }
+// ====================== 6. 字符映射与按键转换 ======================
 // 判断是否需要Shift + 字符映射
 bool needShift(char c, int &outCh) {
   switch (c) {
@@ -190,41 +267,45 @@ int getKeyChannel(char c) {
     default:   return -1;
   }
 }
-// ====================== 打字函数（适配IDEA缩进） ======================
-void typeText(String s) {
+
+// ====================== 7. 文本输入执行逻辑 ======================
+// 打字函数（适配IDEA缩进）
+void typeText(const String& text) {
   Serial.println("[TYPE] =====开始输出文本=====");
-  Serial.printf("[TYPE] 总长度=%u, 原始内容=%s\n", s.length(), s.c_str());
-  for (int i = 0; i < s.length(); i++) {
-    char c = s[i];
-    int ch;
-    // Shift符号处理
+  Serial.printf("[TYPE] 总长度=%u, 原始内容=%s\n", text.length(), text.c_str());
+
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    int ch = -1;
+
     if (needShift(c, ch)) {
       shiftKeyPress(ch);
       continue;
     }
-    // 大写字母处理
+
     if (c >= 'A' && c <= 'Z') {
       ch = getKeyChannel(c + 32);
       shiftKeyPress(ch);
       continue;
     }
-    // 普通字符
+
     ch = getKeyChannel(c);
     if (ch >= 0) {
       keyPress(ch);
-      // 修复IDEA缩进：延时等待IDE处理 + Home键回到行首
-      if(c == '\n'){
+      if (c == '\n') {
         delay(80);
         keyPress(KEY_HOME);
       }
     }
   }
+
   Serial.println("[TYPE] =====输出文本完成=====");
 }
-// ===================== 网页界面（100%原样保留） =====================
+
+// ====================== 8. 网页界面与 HTML 模板 ======================
+// 首页：主界面 + 速度控制 + WiFi 切换入口
 void sendHomePage() {
-  String apIP = WiFi.softAPIP().toString();
-  String staIP = (WiFi.status() == WL_CONNECTED)? localIP.toString() : "0.0.0.0";
+  String staIP = getStationIpString();
   String speedName = getSpeedName();
   String html = R"HTML(
 <!DOCTYPE html>
@@ -278,10 +359,10 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
 <div class="accordion">
   <button class="accordion-header" onclick="toggleSpeed()">⚡ 打字速度 - 当前：)HTML"+speedName+R"HTML(</button>
   <div class="accordion-content" id="speedPanel">
-    <button class="speed-btn )HTML"+(currentMode==0?"active":"")+R"HTML(" onclick="location.href='/slow'">🐢 慢速 (约 180 字符/分钟)</button>
-    <button class="speed-btn )HTML"+(currentMode==1?"active":"")+R"HTML(" onclick="location.href='/mid'">⚡ 中速 (约 360 字符/分钟)</button>
-    <button class="speed-btn )HTML"+(currentMode==2?"active":"")+R"HTML(" onclick="location.href='/fast'">🚀 快速 (约 600 字符/分钟)</button>
-    <button class="speed-btn )HTML"+(currentMode==3?"active":"")+R"HTML(" onclick="location.href='/human'">👤 拟人速 (约 120~200 字符/分钟)</button>
+    )HTML" + buildSpeedButtonHtml(0, "🐢 慢速 (约 180 字符/分钟)", "/slow") + R"HTML(
+    )HTML" + buildSpeedButtonHtml(1, "⚡ 中速 (约 360 字符/分钟)", "/mid") + R"HTML(
+    )HTML" + buildSpeedButtonHtml(2, "🚀 快速 (约 600 字符/分钟)", "/fast") + R"HTML(
+    )HTML" + buildSpeedButtonHtml(3, "👤 拟人速 (约 120~200 字符/分钟)", "/human") + R"HTML(
   </div>
 </div>
 <!-- WiFi折叠面板 -->
@@ -314,9 +395,10 @@ function toggleSpeed(){
 )HTML";
   server.send(200, "text/html", html);
 }
+
+// 扫描页：展示当前信道附近 WiFi，并发起连接表单
 void sendScanPage() {
-  bool isStaOnline = (WiFi.status() == WL_CONNECTED);
-  String staIP = isStaOnline? localIP.toString() : "0.0.0.0";
+  String staIP = getStationIpString();
   String html = R"HTML(
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -356,9 +438,7 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
   <h4>附近 WiFi</h4>
 )HTML";
   WiFi.scanDelete();
-  // ==============================================
   // 核心修复：仅扫描当前STA信道 → STA绝对不断网
-  // ==============================================
   int currentChannel = WiFi.channel(); // 获取当前连接的WiFi信道
   int n = WiFi.scanNetworks(false, false, currentChannel, 120);
 
@@ -385,6 +465,8 @@ textarea{width:100%;height:220px;padding:10px;border-radius:8px;border:1px solid
 )HTML";
   server.send(200, "text/html", html);
 }
+
+// 连接页：显示 SSID 并收集密码
 void sendGoPage() {
   String ssid = server.arg("ssid");
   String html = R"HTML(
@@ -407,7 +489,14 @@ button{width:100%;padding:10px;background:#007bff;color:white;border:none;border
 )HTML";
   server.send(200, "text/html", html);
 }
-// Web请求处理函数
+
+// ====================== 9. Web 路由处理逻辑 ======================
+// 通用辅助：处理完请求后返回首页
+void redirectToRoot() {
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
 void handleConn() {
   Serial.println("[WEB] 收到 /conn 请求，WiFi连接");
   String ssid = server.arg("ssid");
@@ -427,20 +516,37 @@ void handleConn() {
       break;
     }
   }
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "");
+  redirectToRoot();
 }
+
 void handleRun() {
   Serial.println("[WEB] 收到 /run 请求，执行typeText");
   typeText(server.arg("content"));
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "");
+  redirectToRoot();
 }
-void handleSlow()  { Serial.println("[WEB] /slow"); setSpeedSlow();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleMid()   { Serial.println("[WEB] /mid"); setSpeedMid();   server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleFast()  { Serial.println("[WEB] /fast"); setSpeedFast();  server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-void handleHuman() { Serial.println("[WEB] /human"); setSpeedHuman(); server.sendHeader("Location", "/"); server.send(302, "text/plain", ""); }
-// ===================== 初始化 =====================
+
+// 速度路由：切换不同打字节奏
+void handleSlow()  { Serial.println("[WEB] /slow"); setSpeedSlow();  redirectToRoot(); }
+void handleMid()   { Serial.println("[WEB] /mid"); setSpeedMid();   redirectToRoot(); }
+void handleFast()  { Serial.println("[WEB] /fast"); setSpeedFast();  redirectToRoot(); }
+void handleHuman() { Serial.println("[WEB] /human"); setSpeedHuman(); redirectToRoot(); }
+
+// ====================== 10. 路由注册与设备启动 ======================
+// 路由注册：统一把 URL 映射到对应处理函数
+void registerWebRoutes() {
+  server.on("/", sendHomePage);
+  server.on("/scan", sendScanPage);
+  server.on("/go", sendGoPage);
+  server.on("/conn", handleConn);
+  server.on("/run", handleRun);
+  server.on("/slow", handleSlow);
+  server.on("/mid", handleMid);
+  server.on("/fast", handleFast);
+  server.on("/human", handleHuman);
+}
+
+// ====================== 11. 启动流程 ======================
+// 初始化：配置引脚、速度、WiFi 和 WebServer
 void setup() {
   Serial.begin(115200);
   delay(600);
@@ -474,19 +580,14 @@ void setup() {
   wifiMonitor();
 
   // Web路由注册
-  server.on("/", sendHomePage);
-  server.on("/scan", sendScanPage);
-  server.on("/go", sendGoPage);
-  server.on("/conn", handleConn);
-  server.on("/run", handleRun);
-  server.on("/slow", handleSlow);
-  server.on("/mid",  handleMid);
-  server.on("/fast", handleFast);
-  server.on("/human",handleHuman);
+  registerWebRoutes();
   server.begin();
   Serial.println("[SETUP] WebServer 80端口启动完成");
   Serial.println("========== SYSTEM BOOT READY ==========\n");
 }
+
+// ====================== 12. 主循环 ======================
+// 主循环：保持 WiFi 状态同步，并处理 Web 请求
 void loop() {
   wifiMonitor();
   server.handleClient();
